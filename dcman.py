@@ -9,7 +9,6 @@
 
 # TODO: Allow rebuilding 
 # TODO: Show logs of a service
-# TODO: Remove UI stutter
 
 """
 Docker Compose Manager - A TUI tool to manage multiple docker-compose projects
@@ -206,6 +205,7 @@ class DockerComposeManagerApp(App):
         self.services: List[Service] = []
         self.manager = DockerComposeManager()
         self.root_path = root_path or Path.cwd()
+        self.service_to_row_key: dict[int, object] = {}  # Maps service index to row key
     
     def compose(self) -> ComposeResult:
         """Create child widgets"""
@@ -225,52 +225,180 @@ class DockerComposeManagerApp(App):
         table = self.query_one("#service-table", ServiceList)
         table.add_columns("Project", "Service", "Status")
         
-        self.load_services()
-        self.set_status("Ready. Use buttons or keys (s=start, t=stop, e=restart, r=refresh, q=quit)")
-    
-    def load_services(self) -> None:
-        """Load all services from docker-compose files"""
+        # Show empty table immediately
         self.set_status("Scanning for docker-compose files...")
-        compose_files = self.manager.find_compose_files(self.root_path)
+        
+        # Load services in background
+        self.run_worker(self.load_services_async(), exclusive=True)
+        
+    async def load_services_async(self) -> None:
+        """Load all services from docker-compose files asynchronously"""
+        loop = asyncio.get_event_loop()
+        
+        # Find compose files in background
+        compose_files = await loop.run_in_executor(
+            None,
+            self.manager.find_compose_files,
+            self.root_path
+        )
         
         if not compose_files:
             self.set_status(f"No docker-compose files found in {self.root_path}")
             return
         
-        self.services = []
-        for compose_file in compose_files:
-            project_name, service_names = self.manager.parse_compose_file(compose_file)
-            if service_names:
-                for service_name in service_names:
-                    service = Service(
-                        name=service_name,
-                        project_name=project_name,
-                        project_path=compose_file.parent,
-                        compose_file=compose_file
-                    )
-                    self.services.append(service)
+        self.set_status(f"Found {len(compose_files)} docker-compose projects, loading services...")
         
-        self.refresh_table()
-        self.set_status(f"Found {len(self.services)} services in {len(compose_files)} projects")
+        # Process each compose file separately
+        for compose_file in compose_files:
+            await self.load_project_async(compose_file)
+        
+        self.set_status(f"Found {len(self.services)} services in {len(compose_files)} projects. Ready.")
+    
+    async def load_project_async(self, compose_file: Path) -> None:
+        """Load a single project's services asynchronously"""
+        loop = asyncio.get_event_loop()
+        
+        # Parse compose file
+        project_name, service_names = await loop.run_in_executor(
+            None,
+            self.manager.parse_compose_file,
+            compose_file
+        )
+        
+        if not service_names:
+            return
+        
+        # Add services to the list with "loading" status
+        project_services = []
+        start_index = len(self.services)  # Track starting index before adding
+        
+        for service_name in service_names:
+            service = Service(
+                name=service_name,
+                project_name=project_name,
+                project_path=compose_file.parent,
+                compose_file=compose_file,
+                status="loading"
+            )
+            self.services.append(service)
+            project_services.append(service)
+        
+        # Add to table immediately with loading status
+        self.add_services_to_table(project_services, start_index)
+        
+        # Fetch status for each service in background
+        await self.refresh_project_status_async(project_name)
+    
+    def add_services_to_table(self, services: List[Service], start_index: int) -> None:
+        """Add services to the table"""
+        table = self.query_one("#service-table", ServiceList)
+        
+        for i, service in enumerate(services):
+            status_display = self.format_status(service.status)
+            # add_row returns the row key - we need to store it properly
+            row_key = table.add_row(service.project_name, service.name, status_display)
+            # Map service index to row key using the proper index
+            service_idx = start_index + i
+            self.service_to_row_key[service_idx] = row_key
+    
+    def rebuild_table(self) -> None:
+        """Rebuild the entire table from current service data"""
+        table = self.query_one("#service-table", ServiceList)
+        
+        # Remember cursor position and scroll offset
+        old_cursor = table.cursor_row if table.row_count > 0 else 0
+        old_scroll_y = table.scroll_y
+        
+        # Clear and rebuild
+        table.clear()
+        self.service_to_row_key.clear()
+        
+        for idx, service in enumerate(self.services):
+            status_display = self.format_status(service.status)
+            row_key = table.add_row(service.project_name, service.name, status_display)
+            self.service_to_row_key[idx] = row_key
+        
+        # Restore cursor position and scroll
+        if table.row_count > 0:
+            # Move cursor without automatic scrolling by first restoring scroll position
+            table.move_cursor(row=min(old_cursor, table.row_count - 1))
+            # Then force the scroll back to where it was
+            table.scroll_y = old_scroll_y
+    
+    def format_status(self, status: str) -> str:
+        """Format status with color coding"""
+        if status == "running":
+            return "[green]running[/green]"
+        elif status == "stopped":
+            return "[red]stopped[/red]"
+        elif status == "loading":
+            return "[cyan]loading...[/cyan]"
+        else:
+            return "[yellow]" + status + "[/yellow]"
+    
+    async def refresh_services_async(self, services: List[Service]) -> None:
+        """Refresh status for a list of services in parallel"""
+        loop = asyncio.get_event_loop()
+        
+        # Fetch status for all services in parallel
+        async def fetch_status(service: Service) -> Tuple[Service, str]:
+            status = await loop.run_in_executor(
+                None,
+                self.manager.get_service_status,
+                service.project_path,
+                service.name
+            )
+            return service, status
+        
+        # Run all status fetches in parallel
+        results = await asyncio.gather(*[fetch_status(service) for service in services])
+        
+        # Update all service statuses
+        for service, status in results:
+            service.status = status
+        
+        # Rebuild the table after all status updates
+        self.rebuild_table()
+    
+    async def refresh_project_status_async(self, project_name: str) -> None:
+        """Refresh status for all services in a project in parallel"""
+        # Get all services for this project
+        project_services = [s for s in self.services if s.project_name == project_name]
+        
+        # Use the common refresh function
+        await self.refresh_services_async(project_services)
+    
+    def get_service_row_key(self, service: Service) -> Optional[object]:
+        """Get the row key for a service"""
+        try:
+            service_idx = self.services.index(service)
+            return self.service_to_row_key.get(service_idx)
+        except ValueError:
+            pass
+        return None
+    
+    async def refresh_all_async(self) -> None:
+        """Refresh all services asynchronously in parallel"""
+        self.set_status("Refreshing all services...")
+        
+        # Set all services to loading status
+        for service in self.services:
+            service.status = "loading"
+        self.rebuild_table()
+        
+        # Use the common refresh function
+        await self.refresh_services_async(self.services)
+        
+        self.set_status("All services refreshed")
     
     def refresh_table(self) -> None:
-        """Refresh the service table"""
-        table = self.query_one("#service-table", ServiceList)
-        table.clear()
-        
+        """Refresh the entire service table (synchronous version - deprecated, use refresh_all_async)"""
         for service in self.services:
             status = self.manager.get_service_status(service.project_path, service.name)
             service.status = status
-            
-            # Color code the status
-            if status == "running":
-                status_display = "[green]running[/green]"
-            elif status == "stopped":
-                status_display = "[red]stopped[/red]"
-            else:
-                status_display = "[yellow]" + status + "[/yellow]"
-            
-            table.add_row(service.project_name, service.name, status_display)
+        
+        # Rebuild table with updated statuses
+        self.rebuild_table()
     
     def get_selected_service(self) -> Optional[Service]:
         """Get the currently selected service"""
@@ -279,7 +407,9 @@ class DockerComposeManagerApp(App):
             return None
         
         cursor_row = table.cursor_row
-        if cursor_row < len(self.services):
+        # Since we rebuild the table in the same order as services list,
+        # we can directly use cursor_row as index
+        if 0 <= cursor_row < len(self.services):
             return self.services[cursor_row]
         return None
     
@@ -295,9 +425,29 @@ class DockerComposeManagerApp(App):
             self.set_status("No service selected")
             return
         
-        self.set_status(f"Executing {action} on {service.project_name}/{service.name}...")
+        # Prevent actions on services that are currently loading
+        if service.status == "loading":
+            self.set_status(f"Cannot {action} {service.name}: operation in progress")
+            return
         
-        # Run in executor to avoid blocking
+        project_name = service.project_name
+        
+        self.set_status(f"Executing {action} on {project_name}/{service.name}...")
+        
+        # Set all services in this project to "loading" status
+        project_services = [s for s in self.services if s.project_name == project_name]
+        
+        if action == "start":
+            # On start, set all services to loading
+            for svc in project_services:
+                svc.status = "loading"
+        else:            
+            service.status = "loading"
+        
+        # Rebuild table to show loading status
+        self.rebuild_table()
+        
+        # Run action in executor to avoid blocking
         loop = asyncio.get_event_loop()
         success, message = await loop.run_in_executor(
             None,
@@ -309,9 +459,13 @@ class DockerComposeManagerApp(App):
         
         self.set_status(message)
         
-        # Refresh the table after action
-        await asyncio.sleep(1)
-        self.refresh_table()
+        if action == "start":
+            # On start, refresh all services in the project
+            # await asyncio.sleep(0.5)
+            await self.refresh_project_status_async(project_name)
+        else:
+            # On stop/restart, refresh only the affected service
+            await self.refresh_services_async([service])
     
     def action_start(self) -> None:
         """Start the selected service"""
@@ -332,6 +486,11 @@ class DockerComposeManagerApp(App):
             self.set_status("No service selected")
             return
         
+        # Prevent toggle on services that are currently loading
+        if service.status == "loading":
+            self.set_status(f"Cannot toggle {service.name}: operation in progress")
+            return
+        
         # Determine action based on current status
         if service.status == "running":
             self.run_worker(self.perform_action("stop"))
@@ -340,9 +499,7 @@ class DockerComposeManagerApp(App):
     
     def action_refresh(self) -> None:
         """Refresh the service list"""
-        self.set_status("Refreshing...")
-        self.refresh_table()
-        self.set_status("Refreshed")
+        self.run_worker(self.refresh_all_async())
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses"""
