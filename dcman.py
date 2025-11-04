@@ -7,8 +7,7 @@
 # ]
 # ///
 
-# TODO: Allow rebuilding 
-# TODO: Show logs of a service
+# TODO: Allow rebuilding
 
 """
 Docker Compose Manager - A TUI tool to manage multiple docker-compose projects
@@ -23,10 +22,11 @@ from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 from textual.app import App, ComposeResult
-from textual.containers import Vertical, Horizontal
-from textual.widgets import Header, Footer, DataTable, Static, Button
+from textual.containers import Vertical, Horizontal, VerticalScroll
+from textual.widgets import Header, Footer, DataTable, Static, Button, RichLog
 from textual.binding import Binding
 from textual.reactive import reactive
+from textual.screen import ModalScreen
 
 
 @dataclass
@@ -127,6 +127,132 @@ class DockerComposeManager:
                 return False, f"Error: {result.stderr}"
         except Exception as e:
             return False, f"Exception: {str(e)}"
+    
+    @staticmethod
+    def get_service_logs(project_path: Path, service_name: str, tail: int = 100) -> str:
+        """Get logs for a service"""
+        try:
+            result = subprocess.run(
+                ["docker", "compose", "logs", "--tail", str(tail), service_name],
+                cwd=project_path,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                return result.stdout if result.stdout else "No logs available"
+            else:
+                return f"Error fetching logs: {result.stderr}"
+        except Exception as e:
+            return f"Exception: {str(e)}"
+
+
+class LogsScreen(ModalScreen):
+    """Modal screen to display service logs"""
+    
+    CSS = """
+    LogsScreen {
+        align: center middle;
+    }
+    
+    #logs-container {
+        width: 90%;
+        height: 90%;
+        border: thick $primary;
+        background: $surface;
+    }
+    
+    #logs-title {
+        dock: top;
+        height: 3;
+        background: $primary;
+        color: $text;
+        content-align: center middle;
+        text-style: bold;
+    }
+    
+    #logs-scroll {
+        height: 1fr;
+    }
+    
+    #logs-content {
+        padding: 1;
+    }
+    
+    #logs-footer {
+        dock: bottom;
+        height: 3;
+        background: $boost;
+        content-align: center middle;
+    }
+    """
+    
+    BINDINGS = [
+        Binding("escape,q", "dismiss", "Close"),
+    ]
+    
+    def __init__(self, service: Service, logs: str, manager: 'DockerComposeManager'):
+        super().__init__()
+        self.service = service
+        self.logs = logs
+        self.manager = manager
+        self.refresh_timer = None
+    
+    def compose(self) -> ComposeResult:
+        with Vertical(id="logs-container"):
+            yield Static(f"Logs: {self.service.project_name}/{self.service.name}", id="logs-title")
+            with VerticalScroll(id="logs-scroll"):
+                # Disable markup to show logs as plain text
+                logs_widget = Static(self.logs, id="logs-content")
+                logs_widget._render_markup = False
+                yield logs_widget
+            yield Static("Press ESC or Q to close | Logs refresh every second", id="logs-footer")
+    
+    def on_mount(self) -> None:
+        """Scroll to bottom when mounted and start auto-refresh"""
+        # Schedule scroll to bottom after content is rendered
+        self.call_after_refresh(self.scroll_to_bottom)
+        # Start auto-refresh timer (refresh every 1 second)
+        self.refresh_timer = self.set_interval(1.0, self.refresh_logs)
+    
+    def on_unmount(self) -> None:
+        """Stop auto-refresh when unmounted"""
+        if self.refresh_timer is not None:
+            self.refresh_timer.stop()
+    
+    async def refresh_logs(self) -> None:
+        """Fetch and update logs"""
+        loop = asyncio.get_event_loop()
+        
+        # Check if we're at the bottom before refresh
+        scroll = self.query_one("#logs-scroll", VerticalScroll)
+        was_at_bottom = scroll.scroll_y >= scroll.max_scroll_y - 1
+        
+        # Fetch new logs in background
+        new_logs = await loop.run_in_executor(
+            None,
+            self.manager.get_service_logs,
+            self.service.project_path,
+            self.service.name,
+            200  # Keep last 200 lines
+        )
+        
+        # Update the logs content
+        logs_widget = self.query_one("#logs-content", Static)
+        logs_widget.update(new_logs)
+        
+        # Auto-scroll to bottom if we were already at the bottom
+        if was_at_bottom:
+            self.call_after_refresh(self.scroll_to_bottom)
+    
+    def scroll_to_bottom(self) -> None:
+        """Scroll the logs to the bottom"""
+        scroll = self.query_one("#logs-scroll", VerticalScroll)
+        scroll.scroll_end(animate=False)
+    
+    def action_dismiss(self) -> None:
+        self.dismiss()
 
 
 class ServiceList(DataTable):
@@ -198,6 +324,7 @@ class DockerComposeManagerApp(App):
         Binding("s", "start", "Start"),
         Binding("t", "stop", "Stop"),
         Binding("e", "restart", "Restart"),
+        Binding("l", "logs", "Logs"),
     ]
     
     def __init__(self, root_path: Optional[Path] = None):
@@ -216,6 +343,7 @@ class DockerComposeManagerApp(App):
                 yield Button("Start", variant="success", id="btn-start")
                 yield Button("Stop", variant="error", id="btn-stop")
                 yield Button("Restart", variant="warning", id="btn-restart")
+                yield Button("Logs", variant="default", id="btn-logs")
                 yield Button("Refresh", variant="primary", id="btn-refresh")
             yield StatusBar(id="status-bar")
         yield Footer()
@@ -501,6 +629,33 @@ class DockerComposeManagerApp(App):
         """Refresh the service list"""
         self.run_worker(self.refresh_all_async())
     
+    def action_logs(self) -> None:
+        """Show logs for the selected service"""
+        service = self.get_selected_service()
+        if not service:
+            self.set_status("No service selected")
+            return
+        
+        self.set_status(f"Fetching logs for {service.project_name}/{service.name}...")
+        self.run_worker(self.show_logs_async(service))
+    
+    async def show_logs_async(self, service: Service) -> None:
+        """Fetch and display logs for a service"""
+        loop = asyncio.get_event_loop()
+        
+        # Fetch logs in background
+        logs = await loop.run_in_executor(
+            None,
+            self.manager.get_service_logs,
+            service.project_path,
+            service.name,
+            200  # Get last 200 lines
+        )
+        
+        # Show logs in modal screen with auto-refresh
+        self.push_screen(LogsScreen(service, logs, self.manager))
+        self.set_status("Ready")
+    
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses"""
         button_id = event.button.id
@@ -510,6 +665,8 @@ class DockerComposeManagerApp(App):
             self.action_stop()
         elif button_id == "btn-restart":
             self.action_restart()
+        elif button_id == "btn-logs":
+            self.action_logs()
         elif button_id == "btn-refresh":
             self.action_refresh()
     
