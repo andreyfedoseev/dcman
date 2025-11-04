@@ -7,23 +7,21 @@
 # ]
 # ///
 
-# TODO: Allow rebuilding
-
 """
 Docker Compose Manager - A TUI tool to manage multiple docker-compose projects
 """
 
 import argparse
 import asyncio
-import subprocess
 import yaml
 from pathlib import Path
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
+from collections import deque
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, Horizontal, VerticalScroll
-from textual.widgets import Header, Footer, DataTable, Static, Button, RichLog
+from textual.widgets import Header, Footer, DataTable, Static, Button
 from textual.binding import Binding
 from textual.reactive import reactive
 from textual.screen import ModalScreen
@@ -45,7 +43,95 @@ class Service:
 
 
 class DockerComposeManager:
-    """Handles Docker Compose operations"""
+    """Manages docker-compose operations"""
+    
+    @staticmethod
+    async def run_docker_command_async(
+        cmd: List[str], 
+        cwd: Path, 
+        timeout: int = 60,
+        stream_callback = None,
+        max_lines: Optional[int] = None,
+        combine_stderr: bool = False
+    ) -> Tuple[int, str, str]:
+        """
+        Run a docker command asynchronously and return (returncode, stdout, stderr)
+        
+        Args:
+            cmd: Command to execute
+            cwd: Working directory
+            timeout: Timeout in seconds
+            stream_callback: Optional callback called with each line of output
+            max_lines: If set, keep only the last N lines of output
+            combine_stderr: If True, combine stderr with stdout (for streaming build output)
+        """
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT if combine_stderr else asyncio.subprocess.PIPE
+            )
+            
+            try:
+                # If streaming is enabled, read line by line
+                if stream_callback is not None or max_lines is not None:
+                    # Use deque with maxlen for automatic line limiting
+                    lines = deque(maxlen=max_lines) if max_lines else deque()
+                    
+                    if process.stdout:
+                        while True:
+                            line = await asyncio.wait_for(
+                                process.stdout.readline(),
+                                timeout=timeout
+                            )
+                            if not line:
+                                break
+                            
+                            decoded_line = line.decode('utf-8', errors='replace')
+                            lines.append(decoded_line)
+                            
+                            # Call the callback with each line if provided
+                            if stream_callback:
+                                stream_callback(decoded_line)
+                    
+                    # Wait for process to complete
+                    await process.wait()
+                    
+                    stdout = ''.join(lines)
+                    stderr = ""
+                    
+                else:
+                    # Normal mode: read all at once
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=timeout
+                    )
+                    stdout = stdout.decode()
+                    stderr = stderr.decode() if stderr else ""
+                
+                returncode = process.returncode if process.returncode is not None else -1
+                return returncode, stdout, stderr
+                
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                return -1, "", f"Command timed out after {timeout} seconds"
+            except asyncio.CancelledError:
+                # Handle task cancellation - kill the process and wait for cleanup
+                if process.returncode is None:
+                    process.kill()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pass  # Process didn't terminate, but we tried
+                raise
+        except asyncio.CancelledError:
+            raise  # Re-raise cancellation
+        except Exception as e:
+            return -1, "", str(e)
     
     @staticmethod
     def find_compose_files(root_path: Path) -> List[Path]:
@@ -74,35 +160,32 @@ class DockerComposeManager:
             return "", []
     
     @staticmethod
-    def get_service_status(project_path: Path, service_name: str) -> str:
-        """Get the status of a service"""
+    async def get_service_status_async(project_path: Path, service_name: str) -> str:
+        """Get the status of a service asynchronously"""
         try:
-            result = subprocess.run(
+            returncode, stdout, stderr = await DockerComposeManager.run_docker_command_async(
                 ["docker", "compose", "ps", "-q", service_name],
                 cwd=project_path,
-                capture_output=True,
-                text=True,
                 timeout=5
             )
             
-            if not result.stdout.strip():
+            if returncode != 0 or not stdout.strip():
                 return "stopped"
             
-            container_id = result.stdout.strip()
-            result = subprocess.run(
+            container_id = stdout.strip()
+            returncode, stdout, stderr = await DockerComposeManager.run_docker_command_async(
                 ["docker", "inspect", "-f", "{{.State.Status}}", container_id],
-                capture_output=True,
-                text=True,
+                cwd=project_path,
                 timeout=5
             )
             
-            return result.stdout.strip() or "unknown"
+            return stdout.strip() or "unknown"
         except Exception:
             return "unknown"
     
     @staticmethod
-    def execute_action(project_path: Path, service_name: str, action: str) -> Tuple[bool, str]:
-        """Execute an action (start/stop/restart) on a service"""
+    async def execute_action_async(project_path: Path, service_name: str, action: str) -> Tuple[bool, str]:
+        """Execute an action (start/stop/restart) on a service asynchronously"""
         try:
             if action == "start":
                 cmd = ["docker", "compose", "up", "-d", service_name]
@@ -113,37 +196,82 @@ class DockerComposeManager:
             else:
                 return False, f"Unknown action: {action}"
             
-            result = subprocess.run(
+            returncode, stdout, stderr = await DockerComposeManager.run_docker_command_async(
                 cmd,
                 cwd=project_path,
-                capture_output=True,
-                text=True,
                 timeout=60
             )
             
-            if result.returncode == 0:
+            if returncode == 0:
                 return True, f"Successfully {action}ed {service_name}"
             else:
-                return False, f"Error: {result.stderr}"
+                return False, f"Error: {stderr}"
         except Exception as e:
             return False, f"Exception: {str(e)}"
     
     @staticmethod
-    def get_service_logs(project_path: Path, service_name: str, tail: int = 100) -> str:
-        """Get logs for a service"""
+    async def build_service_async(project_path: Path, service_name: str) -> Tuple[bool, str]:
+        """Build (or rebuild) a service asynchronously"""
         try:
-            result = subprocess.run(
-                ["docker", "compose", "logs", "--tail", str(tail), service_name],
+            cmd = ["docker", "compose", "build", service_name]
+            
+            returncode, stdout, stderr = await DockerComposeManager.run_docker_command_async(
+                cmd,
                 cwd=project_path,
-                capture_output=True,
-                text=True,
-                timeout=10
+                timeout=300  # Building can take longer
             )
             
-            if result.returncode == 0:
-                return result.stdout if result.stdout else "No logs available"
+            if returncode == 0:
+                return True, f"Successfully built {service_name}"
             else:
-                return f"Error fetching logs: {result.stderr}"
+                return False, f"Error: {stderr}"
+        except Exception as e:
+            return False, f"Exception: {str(e)}"
+    
+    @staticmethod
+    async def build_service_streaming_async(
+        project_path: Path, 
+        service_name: str,
+        log_callback = None
+    ) -> Tuple[bool, str]:
+        """Build a service and stream output to a callback"""
+        try:
+            cmd = ["docker", "compose", "build", service_name]
+            
+            returncode, stdout, stderr = await DockerComposeManager.run_docker_command_async(
+                cmd,
+                cwd=project_path,
+                timeout=300,  # Building can take longer
+                stream_callback=log_callback,
+                max_lines=200,  # Keep last 200 lines in memory
+                combine_stderr=True  # Combine stderr with stdout for build output
+            )
+            
+            if returncode == 0:
+                return True, f"Successfully built {service_name}"
+            else:
+                return False, f"Build failed with exit code {returncode}"
+                
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return False, f"Exception: {str(e)}"
+    
+    @staticmethod
+    async def get_service_logs_async(project_path: Path, service_name: str, tail: int = 100) -> str:
+        """Get logs for a service asynchronously"""
+        try:
+            returncode, stdout, stderr = await DockerComposeManager.run_docker_command_async(
+                ["docker", "compose", "logs", "--tail", str(tail), service_name],
+                cwd=project_path,
+                timeout=10,
+                max_lines=tail  # Keep only the requested number of lines
+            )
+            
+            if returncode == 0:
+                return stdout if stdout else "No logs available"
+            else:
+                return f"Error fetching logs: {stderr}"
         except Exception as e:
             return f"Exception: {str(e)}"
 
@@ -192,16 +320,26 @@ class LogsScreen(ModalScreen):
         Binding("escape,q", "dismiss", "Close"),
     ]
     
-    def __init__(self, service: Service, logs: str, manager: 'DockerComposeManager'):
+    def __init__(
+        self, 
+        service: Service, 
+        logs: str, 
+        manager: 'DockerComposeManager',
+        build_logs_ref: Optional[dict] = None,
+        log_type: str = "container"
+    ):
         super().__init__()
         self.service = service
         self.logs = logs
         self.manager = manager
+        self.build_logs_ref = build_logs_ref if build_logs_ref is not None else {}
+        self.log_type = log_type  # "container" or "build"
         self.refresh_timer = None
     
     def compose(self) -> ComposeResult:
         with Vertical(id="logs-container"):
-            yield Static(f"Logs: {self.service.project_name}/{self.service.name}", id="logs-title")
+            log_type_display = "Build Logs" if self.log_type == "build" else "Container Logs"
+            yield Static(f"{log_type_display}: {self.service.project_name}/{self.service.name}", id="logs-title")
             with VerticalScroll(id="logs-scroll"):
                 # Disable markup to show logs as plain text
                 logs_widget = Static(self.logs, id="logs-content")
@@ -223,20 +361,32 @@ class LogsScreen(ModalScreen):
     
     async def refresh_logs(self) -> None:
         """Fetch and update logs"""
-        loop = asyncio.get_event_loop()
-        
         # Check if we're at the bottom before refresh
         scroll = self.query_one("#logs-scroll", VerticalScroll)
         was_at_bottom = scroll.scroll_y >= scroll.max_scroll_y - 1
         
-        # Fetch new logs in background
-        new_logs = await loop.run_in_executor(
-            None,
-            self.manager.get_service_logs,
-            self.service.project_path,
-            self.service.name,
-            200  # Keep last 200 lines
-        )
+        # Determine which logs to fetch based on log type
+        if self.log_type == "build":
+            # Get build logs from the shared reference
+            service_key = f"{self.service.project_name}/{self.service.name}"
+            new_logs = self.build_logs_ref.get(service_key, None)
+            
+            # If build is complete (no longer in build_logs), keep showing the last logs we have
+            if new_logs is None:
+                # Build finished - stop refreshing and keep the current logs displayed
+                if self.refresh_timer is not None:
+                    self.refresh_timer.stop()
+                # Update title to indicate build is complete
+                title = self.query_one("#logs-title", Static)
+                title.update(f"Build Logs (Complete): {self.service.project_name}/{self.service.name}")
+                return  # Don't update logs, keep showing what we have
+        else:
+            # Fetch container logs asynchronously
+            new_logs = await self.manager.get_service_logs_async(
+                self.service.project_path,
+                self.service.name,
+                200  # Keep last 200 lines
+            )
         
         # Update the logs content
         logs_widget = self.query_one("#logs-content", Static)
@@ -324,6 +474,7 @@ class DockerComposeManagerApp(App):
         Binding("s", "start", "Start"),
         Binding("t", "stop", "Stop"),
         Binding("e", "restart", "Restart"),
+        Binding("b", "build", "Build"),
         Binding("l", "logs", "Logs"),
     ]
     
@@ -333,6 +484,8 @@ class DockerComposeManagerApp(App):
         self.manager = DockerComposeManager()
         self.root_path = root_path or Path.cwd()
         self.service_to_row_key: dict[int, object] = {}  # Maps service index to row key
+        self.build_logs: dict[str, str] = {}  # Maps service key to build logs
+        self.build_processes: dict[str, asyncio.subprocess.Process] = {}  # Active build processes
     
     def compose(self) -> ComposeResult:
         """Create child widgets"""
@@ -343,6 +496,7 @@ class DockerComposeManagerApp(App):
                 yield Button("Start", variant="success", id="btn-start")
                 yield Button("Stop", variant="error", id="btn-stop")
                 yield Button("Restart", variant="warning", id="btn-restart")
+                yield Button("Build", variant="default", id="btn-build")
                 yield Button("Logs", variant="default", id="btn-logs")
                 yield Button("Refresh", variant="primary", id="btn-refresh")
             yield StatusBar(id="status-bar")
@@ -461,18 +615,16 @@ class DockerComposeManagerApp(App):
             return "[red]stopped[/red]"
         elif status == "loading":
             return "[cyan]loading...[/cyan]"
+        elif status == "building":
+            return "[magenta]building...[/magenta]"
         else:
             return "[yellow]" + status + "[/yellow]"
     
     async def refresh_services_async(self, services: List[Service]) -> None:
         """Refresh status for a list of services in parallel"""
-        loop = asyncio.get_event_loop()
-        
         # Fetch status for all services in parallel
         async def fetch_status(service: Service) -> Tuple[Service, str]:
-            status = await loop.run_in_executor(
-                None,
-                self.manager.get_service_status,
+            status = await self.manager.get_service_status_async(
                 service.project_path,
                 service.name
             )
@@ -519,14 +671,9 @@ class DockerComposeManagerApp(App):
         
         self.set_status("All services refreshed")
     
-    def refresh_table(self) -> None:
-        """Refresh the entire service table (synchronous version - deprecated, use refresh_all_async)"""
-        for service in self.services:
-            status = self.manager.get_service_status(service.project_path, service.name)
-            service.status = status
-        
-        # Rebuild table with updated statuses
-        self.rebuild_table()
+    async def refresh_table_async(self) -> None:
+        """Refresh the entire service table"""
+        await self.refresh_services_async(self.services)
     
     def get_selected_service(self) -> Optional[Service]:
         """Get the currently selected service"""
@@ -553,8 +700,8 @@ class DockerComposeManagerApp(App):
             self.set_status("No service selected")
             return
         
-        # Prevent actions on services that are currently loading
-        if service.status == "loading":
+        # Prevent actions on services that are currently loading or building
+        if service.status in ("loading", "building"):
             self.set_status(f"Cannot {action} {service.name}: operation in progress")
             return
         
@@ -575,11 +722,8 @@ class DockerComposeManagerApp(App):
         # Rebuild table to show loading status
         self.rebuild_table()
         
-        # Run action in executor to avoid blocking
-        loop = asyncio.get_event_loop()
-        success, message = await loop.run_in_executor(
-            None,
-            self.manager.execute_action,
+        # Run action asynchronously
+        success, message = await self.manager.execute_action_async(
             service.project_path,
             service.name,
             action
@@ -607,6 +751,57 @@ class DockerComposeManagerApp(App):
         """Restart the selected service"""
         self.run_worker(self.perform_action("restart"))
     
+    def action_build(self) -> None:
+        """Build the selected service"""
+        service = self.get_selected_service()
+        if service and service.status in ("loading", "building"):
+            self.set_status(f"Cannot build {service.name}: operation in progress")
+            return
+        self.run_worker(self.perform_build())
+    
+    async def perform_build(self) -> None:
+        """Build the selected service"""
+        service = self.get_selected_service()
+        if not service:
+            self.set_status("No service selected")
+            return
+        
+        # Prevent build on services that are currently loading or building
+        if service.status in ("loading", "building"):
+            self.set_status(f"Cannot build {service.name}: operation in progress")
+            return
+        
+        self.set_status(f"Building {service.project_name}/{service.name}...")
+        
+        # Set service to building status
+        service.status = "building"
+        self.rebuild_table()
+        
+        # Initialize build logs for this service
+        service_key = f"{service.project_name}/{service.name}"
+        self.build_logs[service_key] = ""
+        
+        # Callback to accumulate build logs
+        def append_log(line: str):
+            self.build_logs[service_key] += line
+        
+        # Run build asynchronously with streaming
+        success, message = await self.manager.build_service_streaming_async(
+            service.project_path,
+            service.name,
+            log_callback=append_log
+        )
+        
+        self.set_status(message)
+        
+        # Refresh the service status after build
+        await self.refresh_services_async([service])
+        
+        # Clean up build logs after a delay
+        await asyncio.sleep(5)
+        if service_key in self.build_logs:
+            del self.build_logs[service_key]
+    
     def action_toggle(self) -> None:
         """Toggle the selected service (start if stopped, stop if running)"""
         service = self.get_selected_service()
@@ -614,8 +809,8 @@ class DockerComposeManagerApp(App):
             self.set_status("No service selected")
             return
         
-        # Prevent toggle on services that are currently loading
-        if service.status == "loading":
+        # Prevent toggle on services that are currently loading or building
+        if service.status in ("loading", "building"):
             self.set_status(f"Cannot toggle {service.name}: operation in progress")
             return
         
@@ -629,6 +824,23 @@ class DockerComposeManagerApp(App):
         """Refresh the service list"""
         self.run_worker(self.refresh_all_async())
     
+    def action_quit(self) -> None:
+        """Quit the application, properly cancelling any running workers"""
+        # Cancel all running workers and wait for cleanup
+        async def cleanup_and_quit():
+            # Cancel all workers
+            for worker in self.workers:
+                if not worker.is_finished:
+                    worker.cancel()
+            
+            # Give a short time for cleanup
+            await asyncio.sleep(0.1)
+            
+            # Now exit
+            self.exit()
+        
+        self.run_worker(cleanup_and_quit(), exclusive=True)
+    
     def action_logs(self) -> None:
         """Show logs for the selected service"""
         service = self.get_selected_service()
@@ -641,19 +853,23 @@ class DockerComposeManagerApp(App):
     
     async def show_logs_async(self, service: Service) -> None:
         """Fetch and display logs for a service"""
-        loop = asyncio.get_event_loop()
+        service_key = f"{service.project_name}/{service.name}"
         
-        # Fetch logs in background
-        logs = await loop.run_in_executor(
-            None,
-            self.manager.get_service_logs,
-            service.project_path,
-            service.name,
-            200  # Get last 200 lines
-        )
+        # Check if service is currently building and has build logs
+        if service.status == "building" and service_key in self.build_logs:
+            logs = self.build_logs[service_key] or "Build started, waiting for output..."
+            log_type = "build"
+        else:
+            # Fetch container logs asynchronously
+            logs = await self.manager.get_service_logs_async(
+                service.project_path,
+                service.name,
+                200  # Get last 200 lines
+            )
+            log_type = "container"
         
         # Show logs in modal screen with auto-refresh
-        self.push_screen(LogsScreen(service, logs, self.manager))
+        self.push_screen(LogsScreen(service, logs, self.manager, self.build_logs, log_type))
         self.set_status("Ready")
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -665,6 +881,8 @@ class DockerComposeManagerApp(App):
             self.action_stop()
         elif button_id == "btn-restart":
             self.action_restart()
+        elif button_id == "btn-build":
+            self.action_build()
         elif button_id == "btn-logs":
             self.action_logs()
         elif button_id == "btn-refresh":
