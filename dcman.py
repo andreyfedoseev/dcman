@@ -736,13 +736,8 @@ class DockerComposeManagerApp(App):
         status_bar = self.query_one("#status-bar", StatusBar)
         status_bar.message = message
 
-    async def perform_action(self, action: str) -> None:
+    async def perform_action(self, action: str, service: Service) -> None:
         """Perform an action on the selected service"""
-        service = self.get_selected_service()
-        if not service:
-            self.set_status("No service selected")
-            return
-
         # Prevent actions on services that are currently loading or building
         if service.status in ("loading", "building"):
             self.set_status(f"Cannot {action} {service.name}: operation in progress")
@@ -781,35 +776,41 @@ class DockerComposeManagerApp(App):
 
     def action_start_service(self) -> None:
         """Start the selected service"""
-        self.run_worker(self.perform_action("start"))
+        service = self.get_selected_service()
+        if not service:
+            self.set_status("No service selected")
+            return
+        self.run_worker(self.perform_action("start", service))
 
     def action_stop_service(self) -> None:
         """Stop the selected service"""
-        self.run_worker(self.perform_action("stop"))
+        service = self.get_selected_service()
+        if not service:
+            self.set_status("No service selected")
+            return
+        self.run_worker(self.perform_action("stop", service))
 
     def action_restart_service(self) -> None:
         """Restart the selected service"""
-        self.run_worker(self.perform_action("restart"))
+        service = self.get_selected_service()
+        if not service:
+            self.set_status("No service selected")
+            return
+        self.run_worker(self.perform_action("restart", service))
 
     def action_build_service(self) -> None:
-        """Build the selected service"""
-        service = self.get_selected_service()
-        if service and service.status in ("loading", "building"):
-            self.set_status(f"Cannot build {service.name}: operation in progress")
-            return
-        self.run_worker(self.perform_build())
-
-    async def perform_build(self) -> None:
         """Build the selected service"""
         service = self.get_selected_service()
         if not service:
             self.set_status("No service selected")
             return
-
-        # Prevent build on services that are currently loading or building
         if service.status in ("loading", "building"):
             self.set_status(f"Cannot build {service.name}: operation in progress")
             return
+        self.run_worker(self.perform_build(service))
+
+    async def perform_build(self, service: Service) -> None:
+        """Build the selected service"""
 
         self.set_status(f"Building {service.project_name}/{service.name}...")
 
@@ -854,9 +855,9 @@ class DockerComposeManagerApp(App):
 
         # Determine action based on current status
         if service.status == "running":
-            self.run_worker(self.perform_action("stop"))
+            self.run_worker(self.perform_action("stop", service))
         else:
-            self.run_worker(self.perform_action("start"))
+            self.run_worker(self.perform_action("start", service))
 
     def action_refresh_service_list(self) -> None:
         """Refresh the service list"""
