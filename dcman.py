@@ -153,19 +153,34 @@ class DockerComposeManager:
         return compose_files
 
     @staticmethod
-    def parse_compose_file(compose_file: Path) -> tuple[str, list[str]]:
-        """Parse a docker-compose file and extract service names"""
+    def parse_compose_file(compose_file: Path) -> tuple[str, list[str], str | None]:
+        """Parse a docker-compose file and extract service names.
+
+        Returns:
+            Tuple of (project_name, services, error_message).
+            error_message is None on success, or contains the error description.
+        """
+        project_name = compose_file.parent.name
         try:
             with open(compose_file) as f:
                 compose_data = yaml.safe_load(f)
 
-            services = list(compose_data.get("services", {}).keys())
-            project_name = compose_file.parent.name
+            if compose_data is None:
+                return "", [], f"{project_name}: empty or invalid YAML"
 
-            return project_name, services
+            services = list(compose_data.get("services", {}).keys())
+            if not services:
+                return "", [], f"{project_name}: no services defined"
+
+            return project_name, services, None
+        except yaml.YAMLError as e:
+            # Extract just the first line of YAML error for brevity
+            error_line = str(e).split("\n")[0]
+            return "", [], f"{project_name}: {error_line}"
+        except OSError as e:
+            return "", [], f"{project_name}: {e.strerror}"
         except Exception as e:
-            print(f"Error parsing {compose_file}: {e}")
-            return "", []
+            return "", [], f"{project_name}: {e}"
 
     @staticmethod
     async def get_service_status_async(project_path: Path, service_name: str) -> str:
@@ -516,6 +531,7 @@ class DockerComposeManagerApp(App):
         Binding("e", "restart_service", "Restart"),
         Binding("b", "build_service", "Build"),
         Binding("l", "open_logs", "Logs"),
+        Binding("!", "show_errors", "Errors"),
     ]
 
     def __init__(self, root_path: Path | None = None) -> None:
@@ -525,6 +541,7 @@ class DockerComposeManagerApp(App):
         self.root_path = root_path or Path.cwd()
         self.service_to_row_key: dict[int, object] = {}  # Maps service index to row key
         self.build_logs: dict[str, str] = {}  # Maps service key to build logs
+        self.parse_errors: list[str] = []  # Errors from parsing compose files
         self.build_processes: dict[
             str, asyncio.subprocess.Process
         ] = {}  # Active build processes
@@ -572,26 +589,43 @@ class DockerComposeManagerApp(App):
             f"Found {len(compose_files)} docker-compose projects, loading services..."
         )
 
-        # Process each compose file separately
+        # Process each compose file separately, collecting errors
+        self.parse_errors: list[str] = []
         for compose_file in compose_files:
-            await self.load_project_async(compose_file)
+            error = await self.load_project_async(compose_file)
+            if error:
+                self.parse_errors.append(error)
+
+        # Build final status message (keep it short for status bar)
+        error_summary = (
+            f" [yellow]({len(self.parse_errors)} failed)[/yellow]"
+            if self.parse_errors
+            else ""
+        )
 
         self.set_status(
             f"Found {len(self.services)} services in "
-            f"{len(compose_files)} projects. Ready."
+            f"{len(compose_files)} projects.{error_summary}"
         )
 
-    async def load_project_async(self, compose_file: Path) -> None:
-        """Load a single project's services asynchronously"""
+    async def load_project_async(self, compose_file: Path) -> str | None:
+        """Load a single project's services asynchronously.
+
+        Returns:
+            Error message if parsing failed, None on success.
+        """
         loop = asyncio.get_event_loop()
 
         # Parse compose file
-        project_name, service_names = await loop.run_in_executor(
+        project_name, service_names, error = await loop.run_in_executor(
             None, self.manager.parse_compose_file, compose_file
         )
 
+        if error:
+            return error
+
         if not service_names:
-            return
+            return None
 
         # Add services to the list with "loading" status
         project_services = []
@@ -613,6 +647,7 @@ class DockerComposeManagerApp(App):
 
         # Fetch status for each service in background
         await self.refresh_project_status_async(project_name)
+        return None
 
     def add_services_to_table(self, services: list[Service], start_index: int) -> None:
         """Add services to the table"""
@@ -862,6 +897,36 @@ class DockerComposeManagerApp(App):
     def action_refresh_service_list(self) -> None:
         """Refresh the service list"""
         self.run_worker(self.refresh_all_async())
+
+    def action_show_errors(self) -> None:
+        """Show parsing errors in a notification"""
+        if not self.parse_errors:
+            self.set_status("No errors to display")
+            return
+
+        # Show errors in logs screen (reuse the modal)
+        error_text = "Errors encountered while parsing docker-compose files:\n\n"
+        error_text += "\n".join(f"• {err}" for err in self.parse_errors)
+
+        # Create a dummy service for the logs screen
+        dummy_service = Service(
+            name="errors",
+            project_name="Parse Errors",
+            project_path=self.root_path,
+            compose_file=self.root_path / "docker-compose.yml",
+        )
+
+        # Push a non-refreshing logs screen
+        screen = LogsScreen(dummy_service, error_text, self.manager, {}, "container")
+        # Stop auto-refresh for error display
+        self.push_screen(screen)
+
+        # Stop the timer after pushing (it starts on mount)
+        def stop_refresh() -> None:
+            if screen.refresh_timer:
+                screen.refresh_timer.stop()
+
+        self.call_later(stop_refresh)
 
     async def action_quit(self) -> None:
         """Quit the application, properly cancelling any running workers"""
