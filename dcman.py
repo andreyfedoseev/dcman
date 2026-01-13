@@ -24,7 +24,6 @@ import yaml
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.events import Key
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Static
@@ -467,15 +466,7 @@ class LogsScreen(ModalScreen):
 class ServiceList(DataTable):
     """Custom DataTable for displaying services"""
 
-    def on_key(self, event: Key) -> None:
-        """Handle key presses in the table"""
-        if event.key == "enter":
-            # Toggle the selected service when Enter is pressed
-            if self.cursor_row < self.row_count:
-                row_key = self.get_row_at(self.cursor_row)[0]
-                self.post_message(self.RowSelected(self, self.cursor_row, row_key))
-            event.prevent_default()
-            event.stop()
+    pass
 
 
 class StatusBar(Static):
