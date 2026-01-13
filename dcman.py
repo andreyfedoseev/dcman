@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "textual>=0.47.0",
+#     "textual>=7.0",
 #     "pyyaml>=6.0",
 # ]
 # ///
@@ -401,7 +401,7 @@ class LogsScreen(ModalScreen):
         scroll = self.query_one("#logs-scroll", VerticalScroll)
         scroll.scroll_end(animate=False)
     
-    def action_dismiss(self) -> None:
+    async def action_dismiss(self, result = None) -> None:
         self.dismiss()
 
 
@@ -739,19 +739,19 @@ class DockerComposeManagerApp(App):
             # On stop/restart, refresh only the affected service
             await self.refresh_services_async([service])
     
-    def action_start(self) -> None:
+    def _start_service(self) -> None:
         """Start the selected service"""
         self.run_worker(self.perform_action("start"))
     
-    def action_stop(self) -> None:
+    def _stop_service(self) -> None:
         """Stop the selected service"""
         self.run_worker(self.perform_action("stop"))
     
-    def action_restart(self) -> None:
+    def _restart_service(self) -> None:
         """Restart the selected service"""
         self.run_worker(self.perform_action("restart"))
     
-    def action_build(self) -> None:
+    def _build_service(self) -> None:
         """Build the selected service"""
         service = self.get_selected_service()
         if service and service.status in ("loading", "building"):
@@ -802,7 +802,7 @@ class DockerComposeManagerApp(App):
         if service_key in self.build_logs:
             del self.build_logs[service_key]
     
-    def action_toggle(self) -> None:
+    def _toggle_service(self) -> None:
         """Toggle the selected service (start if stopped, stop if running)"""
         service = self.get_selected_service()
         if not service:
@@ -820,11 +820,11 @@ class DockerComposeManagerApp(App):
         else:
             self.run_worker(self.perform_action("start"))
     
-    def action_refresh(self) -> None:
+    def _refresh_service_list(self) -> None:
         """Refresh the service list"""
         self.run_worker(self.refresh_all_async())
     
-    def action_quit(self) -> None:
+    async def action_quit(self) -> None:
         """Quit the application, properly cancelling any running workers"""
         # Cancel all running workers and wait for cleanup
         async def cleanup_and_quit():
@@ -841,7 +841,7 @@ class DockerComposeManagerApp(App):
         
         self.run_worker(cleanup_and_quit(), exclusive=True)
     
-    def action_logs(self) -> None:
+    def _open_logs(self) -> None:
         """Show logs for the selected service"""
         service = self.get_selected_service()
         if not service:
@@ -876,21 +876,21 @@ class DockerComposeManagerApp(App):
         """Handle button presses"""
         button_id = event.button.id
         if button_id == "btn-start":
-            self.action_start()
+            self._start_service()
         elif button_id == "btn-stop":
-            self.action_stop()
+            self._stop_service()
         elif button_id == "btn-restart":
-            self.action_restart()
+            self._restart_service()
         elif button_id == "btn-build":
-            self.action_build()
+            self._build_service()
         elif button_id == "btn-logs":
-            self.action_logs()
+            self._open_logs()
         elif button_id == "btn-refresh":
-            self.action_refresh()
+            self._refresh_service_list()
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle row selection in the service table (triggered by Enter key)"""
-        self.action_toggle()
+        self._toggle_service()
 
 
 def main():
