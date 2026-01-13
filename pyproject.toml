@@ -9,6 +9,9 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.scripts]
+dcman = "dcman:main"
+
 [tool.ruff]
 lint.select = [
     "F",       # Pyflakes

@@ -31,6 +31,20 @@ No installation is required! You can run the script directly with `uv`:
 uv run dcman.py [directory]
 ```
 
+### Nix
+
+If you use Nix with flakes enabled, you can run `dcman` directly:
+
+```shell
+nix run github:andreyfedoseev/dcman
+```
+
+Or install it into your profile:
+
+```shell
+nix profile install github:andreyfedoseev/dcman
+```
+
 ## Usage
 
 ```shell
