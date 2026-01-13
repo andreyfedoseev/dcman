@@ -2,6 +2,8 @@
 
 A terminal user interface (TUI) tool for managing multiple Docker Compose projects from a single dashboard.
 
+![dcman-screenshot](./dcman.png)
+
 ## Overview
 
 `dcman` scans a directory tree for `docker-compose.yml` files and presents all discovered services in an interactive table. You can start, stop, restart, and build services, as well as view their logs - all from within the terminal.
